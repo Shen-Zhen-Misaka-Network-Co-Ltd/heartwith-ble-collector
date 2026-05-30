@@ -2,6 +2,7 @@ package com.heartwith.shared
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,11 +17,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -38,6 +40,7 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
@@ -67,6 +70,7 @@ data class HeartwithUiState(
     val collecting: Boolean = false,
     val backgroundEnabled: Boolean = true,
     val hideFromRecents: Boolean = false,
+    val showResumeUpload: Boolean = false,
 )
 
 @Composable
@@ -84,6 +88,7 @@ fun HeartwithScreen(
     onConnectDevice: (BleDeviceCandidate) -> Unit = {},
     onDisconnect: () -> Unit = {},
     onCloseCollection: () -> Unit = {},
+    onResumeUpload: () -> Unit = {},
     expandedParticipantIds: Set<String> = emptySet(),
     seriesByParticipantId: Map<String, List<SeriesSample>> = emptyMap(),
     seriesStatusByParticipantId: Map<String, String> = emptyMap(),
@@ -92,6 +97,7 @@ fun HeartwithScreen(
     offlineFilterSeconds: Long? = 60 * 60,
     onOfflineFilterChange: (Long?) -> Unit = {},
     onParticipantClick: (Participant) -> Unit = {},
+    onParticipantMove: (String, Int) -> Unit = { _, _ -> },
     onStartCollect: () -> Unit,
     onRefresh: () -> Unit,
 ) {
@@ -151,6 +157,7 @@ fun HeartwithScreen(
                         onStartCollect = onStartCollect,
                         onDisconnect = onDisconnect,
                         onCloseCollection = onCloseCollection,
+                        onResumeUpload = onResumeUpload,
                     )
                 }
                 if (canCollect) {
@@ -193,19 +200,21 @@ fun HeartwithScreen(
                             )
                         }
                     } else {
-                        items(state.participants.chunked(participantColumns), key = { row ->
+                        itemsIndexed(state.participants.chunked(participantColumns), key = { _, row ->
                             row.joinToString("|") { it.collectorId }
-                        }) { rowParticipants ->
+                        }) { rowIndex, rowParticipants ->
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .widthIn(max = 1280.dp),
                                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                             ) {
-                                rowParticipants.forEach { participant ->
+                                rowParticipants.forEachIndexed { columnIndex, participant ->
                                     ParticipantColumn(
                                         modifier = Modifier.weight(1f),
                                         participant = participant,
+                                        position = rowIndex * participantColumns + columnIndex,
+                                        columns = participantColumns,
                                         expanded = participant.collectorId in expandedParticipantIds,
                                         samples = seriesByParticipantId[participant.collectorId].orEmpty(),
                                         status = seriesStatusByParticipantId[participant.collectorId].orEmpty(),
@@ -213,6 +222,7 @@ fun HeartwithScreen(
                                         useEnglishLabels = english,
                                         onSeriesWindowChange = onSeriesWindowChange,
                                         onClick = { onParticipantClick(participant) },
+                                        onMove = { delta -> onParticipantMove(participant.collectorId, delta) },
                                     )
                                 }
                             }
@@ -265,6 +275,7 @@ private fun StatusOverview(
     onStartCollect: () -> Unit,
     onDisconnect: () -> Unit,
     onCloseCollection: () -> Unit,
+    onResumeUpload: () -> Unit = {},
 ) {
     if (readOnlyWeb && showLobby) {
         Row(
@@ -360,12 +371,18 @@ private fun StatusOverview(
                     Text(
                         text = "上传：${state.uploadStatus}",
                         fontSize = 13.sp,
-                        color = if (state.uploadStatus.contains("失败")) {
+                        color = if (state.uploadStatus.contains("失败") || state.uploadStatus.contains("暂停")) {
                             Color(0xFFE5484D)
                         } else {
                             MiuixTheme.colorScheme.onSurfaceVariantSummary
                         },
                     )
+                    if (state.showResumeUpload) {
+                        TextButton(
+                            text = "恢复上传",
+                            onClick = onResumeUpload,
+                        )
+                    }
                 }
                 if (canCollect && (state.collecting || state.scanning)) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -568,6 +585,8 @@ private fun DeviceCandidateRow(
 private fun ParticipantColumn(
     modifier: Modifier,
     participant: Participant,
+    position: Int,
+    columns: Int,
     expanded: Boolean,
     samples: List<SeriesSample>,
     status: String,
@@ -575,6 +594,7 @@ private fun ParticipantColumn(
     useEnglishLabels: Boolean,
     onSeriesWindowChange: (Long) -> Unit,
     onClick: () -> Unit,
+    onMove: (Int) -> Unit,
 ) {
     Column(
         modifier = modifier,
@@ -583,8 +603,11 @@ private fun ParticipantColumn(
         ParticipantRow(
             modifier = Modifier.fillMaxWidth(),
             participant = participant,
+            position = position,
+            columns = columns,
             selected = expanded,
             onClick = onClick,
+            onMove = onMove,
         )
         if (expanded) {
             HeartRateSeriesCard(
@@ -604,11 +627,45 @@ private fun ParticipantColumn(
 private fun ParticipantRow(
     modifier: Modifier,
     participant: Participant,
+    position: Int,
+    columns: Int,
     selected: Boolean,
     onClick: () -> Unit,
+    onMove: (Int) -> Unit,
 ) {
+    val density = LocalDensity.current
+    val horizontalStepPx = with(density) { 96.dp.toPx() }
+    val verticalStepPx = with(density) { 112.dp.toPx() }
+    var dragOffset by remember(participant.collectorId, position, columns) { mutableStateOf(Offset.Zero) }
     Card(
-        modifier = modifier.heightIn(min = 104.dp),
+        modifier = modifier
+            .heightIn(min = 104.dp)
+            .pointerInput(participant.collectorId, columns) {
+                detectDragGestures(
+                    onDragStart = { dragOffset = Offset.Zero },
+                    onDragEnd = { dragOffset = Offset.Zero },
+                    onDragCancel = { dragOffset = Offset.Zero },
+                    onDrag = { _, dragAmount ->
+                        dragOffset += dragAmount
+                        while (dragOffset.x >= horizontalStepPx) {
+                            onMove(1)
+                            dragOffset = dragOffset.copy(x = dragOffset.x - horizontalStepPx)
+                        }
+                        while (dragOffset.x <= -horizontalStepPx) {
+                            onMove(-1)
+                            dragOffset = dragOffset.copy(x = dragOffset.x + horizontalStepPx)
+                        }
+                        while (dragOffset.y >= verticalStepPx) {
+                            onMove(columns)
+                            dragOffset = dragOffset.copy(y = dragOffset.y - verticalStepPx)
+                        }
+                        while (dragOffset.y <= -verticalStepPx) {
+                            onMove(-columns)
+                            dragOffset = dragOffset.copy(y = dragOffset.y + verticalStepPx)
+                        }
+                    },
+                )
+            },
         colors = CardDefaults.defaultColors(
             color = if (selected) {
                 HyperBlue.copy(alpha = 0.12f)

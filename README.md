@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./clients/heartwith-compose/src/androidMain/res/mipmap-xxxhdpi/ic_launcher.png" alt="HeartWith" width="150"/>
+  <img src="./app/src/androidMain/res/mipmap-xxxhdpi/ic_launcher_round.png" alt="HeartWith" width="150"/>
 </p>
 
 <h1 align="center">HeartWith</h1>
@@ -85,6 +85,15 @@ HeartWith/
 ./gradlew assembleRelease
 ```
 
+产物路径：`app/build/outputs/apk/release/HeartWith-{version}-release.apk`
+
+### CI/CD
+
+项目配置了 GitHub Actions：
+
+- **build.yml** — PR 或手动触发时构建 Debug APK
+- **release.yml** — 发布流程（签名 + Release APK）
+
 ## 权限说明
 
 | 权限 | 用途 |
@@ -129,3 +138,7 @@ HeartWith/
 | POST | `/api/v1/hr/batches` | 上传心率数据批次 |
 | GET | `/api/v1/lobby/participants` | 获取大厅参与者 |
 | GET | `/api/v1/participants/{id}/series` | 获取参与者心率序列 |
+
+## License
+
+[MIT](LICENSE) LICENSE

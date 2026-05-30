@@ -23,6 +23,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.heartwith.shared.BleDeviceCandidate
 import androidx.core.content.ContextCompat
@@ -61,8 +62,10 @@ class AndroidHeartRateCollector(
     private var activeScanner: BluetoothLeScanner? = null
     private var activeScanCallback: ScanCallback? = null
     private var uploadInFlight = false
+    private var uploadStartedMs = 0L
     private var nextUploadAttemptMs = 0L
     private var consecutiveUploadFails = 0
+    private var consecutiveNetworkFails = 0
     private var appInForeground = true
     private var lastDevice: BluetoothDevice? = null
     private var latestStatus: String = "等待开始"
@@ -77,7 +80,7 @@ class AndroidHeartRateCollector(
     private val discoveredDevices = linkedMapOf<String, BluetoothDevice>()
 
     fun isCollectingOrConnecting(): Boolean {
-        return currentGatt != null || activeScanCallback != null || backgroundReconnectJob?.isActive == true
+        return currentGatt != null || activeScanCallback != null
     }
 
     @Synchronized
@@ -312,6 +315,7 @@ class AndroidHeartRateCollector(
             latestRssi = null
             latestBpm = null
             uploadInFlight = false
+            uploadStartedMs = 0L
             nextUploadAttemptMs = 0L
             consecutiveUploadFails = 0
             stopActiveScan()
@@ -335,6 +339,13 @@ class AndroidHeartRateCollector(
         targetAddress: String? = null,
         timeoutMs: Long? = null,
     ) {
+        // 检查 operationId 是否过期，避免竞态条件导致扫描被跳过
+        if (!isCurrentOperation(opId)) {
+            Log.d(TAG, "scanAndConnect: operationId 已过期，跳过扫描")
+            reportStatus("操作已过期，跳过扫描", onStatus)
+            return
+        }
+        
         val scanner = adapter?.bluetoothLeScanner ?: error("蓝牙不可用")
         if (!hasBlePermission()) error("缺少蓝牙权限")
 
@@ -342,9 +353,6 @@ class AndroidHeartRateCollector(
             .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
             .build()
 
-        val filters = targetAddress?.let { addr ->
-            listOf(ScanFilter.Builder().setDeviceAddress(addr).build())
-        }
 
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -365,18 +373,26 @@ class AndroidHeartRateCollector(
             override fun onScanFailed(errorCode: Int) {
                 if (!isCurrentOperation(opId)) return
                 reportStatus("扫描失败：$errorCode", onStatus)
+                if (shouldReconnect) {
+                    scope.launch {
+                        scheduleBackgroundReconnect(displayName, connectedDeviceName, onStatus, onUploadStatus, onBpm)
+                    }
+                }
             }
         }
 
         reportStatus("低功耗扫描附近 BLE 设备", onStatus)
         activeScanner = scanner
         activeScanCallback = callback
-        scanner.startScan(filters, settings, callback)
+        scanner.startScan(null, settings, callback)
         if (timeoutMs != null) {
             delay(timeoutMs)
             if (isCurrentOperation(opId) && activeScanCallback == callback) {
                 stopActiveScan()
                 reportStatus("扫描未发现上次设备，稍后重试", onStatus)
+                if (shouldReconnect) {
+                    scheduleBackgroundReconnect(displayName, connectedDeviceName, onStatus, onUploadStatus, onBpm)
+                }
             }
         }
     }
@@ -404,7 +420,12 @@ class AndroidHeartRateCollector(
         val scanner = activeScanner
         val callback = activeScanCallback
         if (scanner != null && callback != null && hasBlePermission()) {
-            runCatching { scanner.stopScan(callback) }
+            runCatching { 
+                scanner.stopScan(callback)
+                Log.d(TAG, "扫描已停止")
+            }.onFailure { e ->
+                Log.w(TAG, "停止扫描失败: ${e.message}")
+            }
         }
         activeScanner = null
         activeScanCallback = null
@@ -486,28 +507,8 @@ class AndroidHeartRateCollector(
                         currentGatt = null
                     }
                     gatt.close()
-                    if (reconnect && appInForeground) {
-                        reportStatus("设备断开 (status=$status)，扫描重连", onStatus)
-                        scope.launch {
-                            delay(2_000)
-                            val targetAddr = lastDevice?.address
-                            if (isCurrentOperation(opId) && shouldReconnect && appInForeground && targetAddr != null) {
-                                runCatching {
-                                    scanAndConnect(
-                                        displayName, connectedDeviceName,
-                                        onStatus, onUploadStatus, onBpm, opId,
-                                        targetAddress = targetAddr,
-                                        timeoutMs = 8_000L,
-                                    )
-                                }.onFailure {
-                                    if (isCurrentOperation(opId) && shouldReconnect) {
-                                        scheduleBackgroundReconnect(displayName, connectedDeviceName, onStatus, onUploadStatus, onBpm)
-                                    }
-                                }
-                            }
-                        }
-                    } else if (reconnect) {
-                        reportStatus("设备断开，尝试后台扫描重连", onStatus)
+                    if (reconnect) {
+                        reportStatus("设备断开 (status=$status)，尝试重连", onStatus)
                         scheduleBackgroundReconnect(displayName, connectedDeviceName, onStatus, onUploadStatus, onBpm)
                     } else {
                         reportStatus("已断开，可修改服务器地址和显示名称", onStatus)
@@ -633,45 +634,91 @@ class AndroidHeartRateCollector(
         onBpm: (Int) -> Unit,
     ) {
         if (backgroundReconnectJob?.isActive == true) return
-        val opId = operationId.get()
         val targetAddress = lastDevice?.address ?: return
         backgroundReconnectJob = scope.launch {
             var attempt = 0
-            while (shouldReconnect && !appInForeground) {
+            while (shouldReconnect && attempt < MAX_RECONNECT_ATTEMPTS) {
                 attempt++
                 val delayMs = reconnectBackoff(attempt)
-                reportStatus("后台重连 · ${delayMs / 1000}s 后扫描第 ${attempt} 次", onStatus)
+                reportStatus("重连 · ${delayMs / 1000}s 后扫描第 $attempt 次", onStatus)
                 delay(delayMs)
-                if (!isCurrentOperation(opId) || !shouldReconnect || appInForeground) break
+                if (!shouldReconnect) break
                 if (!hasBlePermission()) {
-                    reportStatus("后台重连失败：缺少蓝牙权限", onStatus)
+                    reportStatus("重连失败：缺少蓝牙权限", onStatus)
                     continue
                 }
-                reportStatus("后台扫描上次设备", onStatus)
+                reportStatus("扫描上次设备", onStatus)
                 runCatching {
-                    scanAndConnect(
+                    connectAddress(
+                        address = targetAddress,
+                        name = deviceModel,
                         displayName = displayName,
-                        deviceModel = deviceModel,
                         onStatus = onStatus,
                         onUploadStatus = onUploadStatus,
                         onBpm = onBpm,
-                        opId = opId,
-                        targetAddress = targetAddress,
-                        timeoutMs = TARGET_SCAN_TIMEOUT_MS,
+                        scanFirst = true,
                     )
                 }.onFailure { error ->
-                    if (isCurrentOperation(opId)) reportStatus("后台扫描失败：${error.message}", onStatus)
+                    reportStatus("扫描失败：${error.message}", onStatus)
                 }
+            }
+            if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+                reportStatus("重连 $MAX_RECONNECT_ATTEMPTS 次均失败，请手动重新连接", onStatus)
+                notifyReconnectFailed()
+                shouldReconnect = false
             }
         }
     }
 
+    private fun notifyReconnectFailed() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                UPLOAD_FAILURE_CHANNEL_ID,
+                "连接异常提醒",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "设备连接异常时的提醒"
+                setShowBadge(true)
+                setSound(null, null)
+                enableVibration(false)
+            }
+            context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            action = HeartRateForegroundService.ACTION_OPEN_FROM_NOTIFICATION
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(context, UPLOAD_FAILURE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_heartwith_notification)
+            .setColor(Color.rgb(10, 132, 255))
+            .setContentTitle("Heartwith · 上传已暂停")
+            .setContentText("连续失败 $MAX_RECONNECT_ATTEMPTS 次，已暂停上传")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("设备重连连续失败 $MAX_RECONNECT_ATTEMPTS 次，已暂停上传并断开设备。请打开应用点击「恢复上传」重新连接。"),
+            )
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_ERROR)
+            .setSilent(true)
+            .build()
+        context.getSystemService(NotificationManager::class.java)
+            .notify(UPLOAD_FAILURE_NOTIFICATION_ID, notification)
+    }
+
     private fun reconnectBackoff(attempt: Int): Long = when {
-        attempt <= 1 -> 15_000L
-        attempt == 2 -> 30_000L
-        attempt == 3 -> 60_000L
-        attempt == 4 -> 120_000L
-        else -> 300_000L
+        attempt <= 2 -> 0L
+        attempt == 3 -> 10_000L
+        attempt == 4 -> 15_000L
+        attempt == 5 -> 30_000L
+        else -> 60_000L
     }
 
     private fun onHeartRate(
@@ -686,7 +733,7 @@ class AndroidHeartRateCollector(
         val bpm = measurement.bpm
         reportBpm(bpm, onBpm)
         if (appInForeground) {
-            reportStatus("收到心率 $bpm BPM${latestRssi?.let { " · RSSI $it" } ?: ""}", onStatus)
+            reportStatus("""收到心率 $bpm BPM${latestRssi?.let { " · RSSI $it" } ?: ""}""", onStatus)
         }
         batcher.add(bpm)
         if (appInForeground) {
@@ -695,10 +742,15 @@ class AndroidHeartRateCollector(
         val now = nowMs()
         if (batcher.shouldFlush(lowPower = !appInForeground, tMs = now)) {
             if (uploadInFlight) {
-                if (appInForeground) {
-                    reportUploadStatus("正在上传，继续缓存 ${batcher.size()} 条", onUploadStatus)
+                // Doze 下协程可能被挂起导致 uploadInFlight 卡死，超时则强制重置
+                if (nowMs() - uploadStartedMs > UPLOAD_STUCK_TIMEOUT_MS) {
+                    uploadInFlight = false
+                } else {
+                    if (appInForeground) {
+                        reportUploadStatus("正在上传，继续缓存 ${batcher.size()} 条", onUploadStatus)
+                    }
+                    return
                 }
-                return
             }
             if (now < nextUploadAttemptMs) {
                 val waitSeconds = ((nextUploadAttemptMs - now) / 1000).coerceAtLeast(1)
@@ -708,6 +760,7 @@ class AndroidHeartRateCollector(
                 return
             }
             uploadInFlight = true
+            uploadStartedMs = nowMs()
             scope.launch {
                 upload(displayName, deviceModel, onUploadStatus)
             }
@@ -744,26 +797,44 @@ class AndroidHeartRateCollector(
             seq += 1
             nextUploadAttemptMs = 0L
             consecutiveUploadFails = 0
+            consecutiveNetworkFails = 0
             batcher.markUploaded()
+            cancelPauseNotification()
             reportUploadStatus("上传成功 ${response.accepted} 条 · seq ${seq - 1}", onUploadStatus)
         }.onFailure { error ->
             if (error.message == WAITING_FOR_DEVICE_NAME) {
                 nextUploadAttemptMs = nowMs() + NAME_RETRY_BACKOFF_MS
                 reportUploadStatus("等待蓝牙设备名称 · 已缓存 ${batcher.size()} 条", onUploadStatus)
             } else {
+                val isNetworkError = error.isNetworkError()
+                if (isNetworkError) {
+                    consecutiveNetworkFails++
+                    val summary = error.uploadSummary()
+                    if (consecutiveNetworkFails >= MAX_NETWORK_FAILURES) {
+                        consecutiveUploadFails = MAX_UPLOAD_FAILURES
+                    } else {
+                        nextUploadAttemptMs = nowMs() + NETWORK_RETRY_BACKOFF_MS
+                        reportUploadStatus("网络异常 ($consecutiveNetworkFails/$MAX_NETWORK_FAILURES)：$summary · 已缓存 ${batcher.size()} 条", onUploadStatus)
+                        return@onFailure
+                    }
+                }
                 consecutiveUploadFails++
                 val summary = error.uploadSummary()
                 if (consecutiveUploadFails >= MAX_UPLOAD_FAILURES) {
-                    reportUploadStatus("上传连续失败 ${consecutiveUploadFails} 次，断开设备", onUploadStatus)
-                    notifyUploadFailure()
+                    val failCount = if (isNetworkError) consecutiveNetworkFails else consecutiveUploadFails
+                    val failSource = if (isNetworkError) "网络异常" else "上传失败"
+                    reportUploadStatus("$failSource 累计 $failCount 次，暂停上传", onUploadStatus)
+                    notifyUploadPaused(failCount)
                     shouldReconnect = false
                     session = null
                     sessionDeviceModel = DEFAULT_DEVICE_MODEL
                     closeCurrentGatt(disconnectFirst = true, settleMs = 0L)
-                    reportUploadStatus("未上传", onUploadStatus)
                 } else {
                     nextUploadAttemptMs = nowMs() + UPLOAD_RETRY_BACKOFF_MS
                     reportUploadStatus("上传失败 ($consecutiveUploadFails/$MAX_UPLOAD_FAILURES)：$summary · 已缓存 ${batcher.size()} 条", onUploadStatus)
+                    if (consecutiveUploadFails >= UPLOAD_WARN_FAILURES) {
+                        notifyUploadRetrying(consecutiveUploadFails, summary)
+                    }
                 }
             }
         }
@@ -774,6 +845,21 @@ class AndroidHeartRateCollector(
         val type = this::class.simpleName ?: "UnknownError"
         val message = message?.takeIf { it.isNotBlank() }
         return if (message == null) type else "$type: $message"
+    }
+
+    /** 判断是否为网络层错误（超时、连接失败等），区别于服务端返回的业务错误 */
+    private fun Throwable.isNetworkError(): Boolean {
+        val msg = message?.lowercase() ?: return false
+        return (msg.contains("connect") && msg.contains("expired")) ||
+            msg.contains("timeout") ||
+            msg.contains("connection refused") ||
+            msg.contains("connection reset") ||
+            msg.contains("unresolved host") ||
+            msg.contains("no route to host") ||
+            msg.contains("network is unreachable") ||
+            msg.contains("enotfound") ||
+            msg.contains("econnrefused") ||
+            msg.contains("econnreset")
     }
 
     private fun nextOperationId(): Int = operationId.incrementAndGet()
@@ -871,14 +957,14 @@ class AndroidHeartRateCollector(
         }
     }
 
-    private fun notifyUploadFailure() {
+    private fun notifyUploadRetrying(failCount: Int, summary: String) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = android.app.NotificationChannel(
                 UPLOAD_FAILURE_CHANNEL_ID,
                 "上传异常提醒",
                 NotificationManager.IMPORTANCE_DEFAULT,
             ).apply {
-                description = "心率数据上传连续失败时的提醒"
+                description = "心率数据上传异常时的提醒"
                 setShowBadge(true)
                 setSound(null, null)
                 enableVibration(false)
@@ -898,11 +984,11 @@ class AndroidHeartRateCollector(
         val notification = NotificationCompat.Builder(context, UPLOAD_FAILURE_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_heartwith_notification)
             .setColor(Color.rgb(10, 132, 255))
-            .setContentTitle("Heartwith · 上传失败")
-            .setContentText("心率数据上传连续失败 $consecutiveUploadFails 次，已断开设备")
+            .setContentTitle("Heartwith · 上传异常")
+            .setContentText("已失败 $failCount 次：$summary")
             .setStyle(
                 NotificationCompat.BigTextStyle()
-                    .bigText("心率数据上传连续失败 $consecutiveUploadFails 次，已自动断开设备连接。请检查服务器状态后重连。"),
+                    .bigText("心率上传已失败 $failCount 次（$summary），仍将继续重试。心率采集不受影响，数据已本地缓存。"),
             )
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
@@ -914,19 +1000,104 @@ class AndroidHeartRateCollector(
             .notify(UPLOAD_FAILURE_NOTIFICATION_ID, notification)
     }
 
+    private fun notifyUploadPaused(failCount: Int = consecutiveUploadFails) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = android.app.NotificationChannel(
+                UPLOAD_FAILURE_CHANNEL_ID,
+                "上传异常提醒",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "心率数据上传异常时的提醒"
+                setShowBadge(true)
+                setSound(null, null)
+                enableVibration(false)
+            }
+            context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            action = HeartRateForegroundService.ACTION_OPEN_FROM_NOTIFICATION
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0,
+            openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(context, UPLOAD_FAILURE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_heartwith_notification)
+            .setColor(Color.rgb(10, 132, 255))
+            .setContentTitle("Heartwith · 上传已暂停")
+            .setContentText("连续失败 $failCount 次，已暂停上传")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("心率上传连续失败 $failCount 次，已暂停上传并断开设备。请打开应用点击「恢复上传」重新连接。"),
+            )
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_ERROR)
+            .setSilent(true)
+            .build()
+        context.getSystemService(NotificationManager::class.java)
+            .notify(UPLOAD_FAILURE_NOTIFICATION_ID, notification)
+    }
+
+    private fun cancelPauseNotification() {
+        context.getSystemService(NotificationManager::class.java)
+            .cancel(UPLOAD_FAILURE_NOTIFICATION_ID)
+    }
+
+    fun resumeUpload() {
+        consecutiveUploadFails = 0
+        consecutiveNetworkFails = 0
+        uploadInFlight = false
+        uploadStartedMs = 0L
+        shouldReconnect = true
+        cancelPauseNotification()
+        val prefs = context.getSharedPreferences(HeartRateForegroundService.PREFS_NAME, Context.MODE_PRIVATE)
+        val lastAddress = prefs.getString(HeartRateForegroundService.KEY_LAST_DEVICE_ADDRESS, null)
+        val lastName = prefs.getString(HeartRateForegroundService.KEY_LAST_DEVICE_NAME, null).orEmpty()
+        val displayName = prefs.getString(HeartRateForegroundService.KEY_DISPLAY_NAME, null)
+            ?: (Build.MODEL ?: "Android")
+        val onStatus: (String) -> Unit = { status -> reportStatus(status, {}) }
+        val onUploadStatus: (String) -> Unit = { status -> reportUploadStatus(status, {}) }
+        val onBpm: (Int) -> Unit = { bpm -> reportBpm(bpm, {}) }
+        if (lastAddress != null) {
+            reportUploadStatus("正在恢复上传，重新连接设备...", {})
+            connectAddress(
+                address = lastAddress,
+                name = lastName,
+                displayName = displayName,
+                onStatus = onStatus,
+                onUploadStatus = onUploadStatus,
+                onBpm = onBpm,
+                scanFirst = true,
+            )
+        } else {
+            reportUploadStatus("未找到历史设备，请手动连接", {})
+        }
+    }
+
     private companion object {
+        private const val TAG = "AndroidHeartRateCollector"
         const val PREFS_NAME = "heartwith_collector"
         const val KEY_LAST_DEVICE_NAME = "last_device_name"
         const val DEFAULT_DEVICE_MODEL = "Android BLE"
         const val WAITING_FOR_DEVICE_NAME = "等待蓝牙设备名称"
         const val SCAN_WINDOW_MS = 12_000L
         const val UPLOAD_RETRY_BACKOFF_MS = 15_000L
+        const val NETWORK_RETRY_BACKOFF_MS = 5_000L
         const val CONNECTION_TIMEOUT_MS = 20_000L
         const val TARGET_SCAN_TIMEOUT_MS = 15_000L
         const val NAME_RETRY_BACKOFF_MS = 8_000L
-        const val MAX_UPLOAD_FAILURES = 3
+        const val MAX_UPLOAD_FAILURES = 6
+        const val MAX_NETWORK_FAILURES = 10
+        const val UPLOAD_WARN_FAILURES = 3
+        const val UPLOAD_STUCK_TIMEOUT_MS = 90_000L
         const val UPLOAD_FAILURE_CHANNEL_ID = "heartwith_upload_failure"
         const val UPLOAD_FAILURE_NOTIFICATION_ID = 1002
+        const val MAX_RECONNECT_ATTEMPTS = 15
 
         fun deviceNameKey(address: String): String = "device_name_${address.replace(':', '_')}"
     }

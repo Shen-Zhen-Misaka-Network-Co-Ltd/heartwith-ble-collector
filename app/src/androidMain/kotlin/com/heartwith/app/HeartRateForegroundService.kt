@@ -24,6 +24,7 @@ class HeartRateForegroundService : Service() {
     private var latestBpm: Int? = null
     private var foregroundStarted = false
     private var reconnectRetryCount = 0
+    private var uploadFailCount = 0
     private var lastNotificationUpdateMs = 0L
 
     override fun onCreate() {
@@ -46,6 +47,10 @@ class HeartRateForegroundService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_RESUME_UPLOAD) {
+            collector?.resumeUpload()
+            return START_STICKY
         }
 
         val bpm = intent?.takeIf { it.hasExtra(EXTRA_BPM) }?.getIntExtra(EXTRA_BPM, 0)?.takeIf { it > 0 }
@@ -182,7 +187,17 @@ class HeartRateForegroundService : Service() {
                 }
                 updateRunningNotification(force = true)
             },
-            onUploadStatus = {},
+            onUploadStatus = { status ->
+                if (status.startsWith("上传失败") || status.startsWith("上传连续失败") || status.startsWith("上传已暂停")) {
+                    uploadFailCount++
+                    if (uploadFailCount >= SERVICE_MAX_UPLOAD_FAILS) {
+                        scheduleResume(applicationContext, BACKGROUND_RETRY_DELAY_MS)
+                        uploadFailCount = 0
+                    }
+                } else if (status.startsWith("上传成功")) {
+                    uploadFailCount = 0
+                }
+            },
             onBpm = { bpm ->
                 latestBpm = bpm
                 reconnectRetryCount = 0
@@ -225,6 +240,7 @@ class HeartRateForegroundService : Service() {
         private const val ACTION_START = "com.heartwith.app.COLLECTOR_SERVICE_START"
         private const val ACTION_RESUME_COLLECT = "com.heartwith.app.COLLECTOR_SERVICE_RESUME_COLLECT"
         const val ACTION_RESTART_COLLECT = "com.heartwith.app.COLLECTOR_SERVICE_RESTART_COLLECT"
+        const val ACTION_RESUME_UPLOAD = "com.heartwith.app.ACTION_RESUME_UPLOAD"
         private const val ACTION_STOP = "com.heartwith.app.COLLECTOR_SERVICE_STOP"
         private const val EXTRA_BPM = "bpm"
         private const val EXTRA_APP_FOREGROUND = "app_foreground"
@@ -243,6 +259,7 @@ class HeartRateForegroundService : Service() {
         private const val FAST_BACKGROUND_RETRY_DELAY_MS = 20_000L
         private const val BACKGROUND_RETRY_DELAY_MS = 60_000L
         private const val BACKGROUND_NOTIFICATION_MIN_INTERVAL_MS = 10_000L
+        private const val SERVICE_MAX_UPLOAD_FAILS = 6
 
         fun start(context: Context, bpm: Int? = null, appInForeground: Boolean = false) {
             val intent = Intent(context, HeartRateForegroundService::class.java).apply {

@@ -14,6 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "heartwith-ble-collector"
-include(":heartwith-compose")
-project(":heartwith-compose").projectDir = file("clients/heartwith-compose")
+rootProject.name = "heartwith"
+include(":app")
